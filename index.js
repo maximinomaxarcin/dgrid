@@ -11,316 +11,402 @@ const config = require("./config.json");
 const ACCOUNTS_FILE = path.join(__dirname, "accounts.json");
 const TOKENS_FILE = path.join(__dirname, "tokens.json");
 
-const RETRY = {
-  maxAccountRetries: 5,
-  maxMissionRetries: 6,
-  baseBackoffMs: 2000,
-  maxBackoffMs: 45000,
-  timeoutMs: 60000,
-  ...(config.retry || {}),
-};
-
 const USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124 Safari/537.36",
-  "Mozilla/5.0 (X11; Linux x86_64) Chrome/123 Safari/537.36",
-  "Mozilla/5.0 (Macintosh) Chrome/122 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
 ];
 
-const randInt = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const pickUA = () => USER_AGENTS[randInt(0, USER_AGENTS.length - 1)];
+function randInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+async function randomDelay(min, max) {
+  return sleep(randInt(min, max));
+}
+function pickUA() {
+  return USER_AGENTS[randInt(0, USER_AGENTS.length - 1)];
+}
 
-const loadJsonSafe = (f, d) => {
+function loadJsonSafe(file, fallback) {
   try {
-    if (fs.existsSync(f)) return JSON.parse(fs.readFileSync(f, "utf8"));
-  } catch {}
-  return d;
-};
-const saveJson = (f, d) => fs.writeFileSync(f, JSON.stringify(d, null, 2));
+    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) {}
+  return fallback;
+}
+function saveJson(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
 
 function loadAccounts() {
-  const a = loadJsonSafe(ACCOUNTS_FILE, []);
-  if (!a.length) {
-    console.log(chalk.red("accounts.json kosong"));
+  const accs = loadJsonSafe(ACCOUNTS_FILE, []);
+  if (!Array.isArray(accs) || accs.length === 0) {
+    console.log(chalk.red("[ERROR] accounts.json kosong / tidak valid"));
     process.exit(1);
   }
-  return a;
+  return accs;
 }
 
-const tokenKeyForAccount = (acc) =>
-  new ethers.Wallet(acc.privateKey).address.toLowerCase();
-const isTokenExpired = (expiredAt) => !expiredAt || Date.now() / 1000 > expiredAt - 300;
+function tokenKeyForAccount(account) {
+  // Simpan token per address (lebih aman daripada key=privateKey)
+  const wallet = new ethers.Wallet(account.privateKey);
+  return wallet.address.toLowerCase();
+}
 
-function createClient(proxy, ua) {
-  const cfg = {
-    baseURL: config.baseUrl,
-    timeout: RETRY.timeoutMs,
-    headers: {
-      Accept: "application/json, text/plain, */*",
-      "Content-Type": "application/json",
-      Origin: "https://dgrid.ai",
-      Referer: "https://dgrid.ai/",
-      "User-Agent": ua,
-    },
+function isTokenExpired(expiredAt) {
+  if (!expiredAt) return true;
+  const now = Date.now() / 1000;
+  return now > expiredAt - 300; // buffer 5 menit
+}
+
+function getHeaders(userAgent) {
+  return {
+    Accept: "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+    Origin: "https://dgrid.ai",
+    Referer: "https://dgrid.ai/",
+    "User-Agent": userAgent,
   };
-  if (proxy && String(proxy).trim() !== "") {
-    cfg.httpsAgent = new HttpsProxyAgent(proxy.includes("://") ? proxy : `http://${proxy}`);
+}
+
+function createClient(proxy, userAgent) {
+  const axiosConfig = {
+    baseURL: config.baseUrl,
+    timeout: 30000,
+    headers: getHeaders(userAgent),
+  };
+
+  if (proxy && typeof proxy === "string" && proxy.trim() !== "") {
+    const proxyUrl = proxy.includes("://") ? proxy : `http://${proxy}`;
+    axiosConfig.httpsAgent = new HttpsProxyAgent(proxyUrl);
   }
-  return axios.create(cfg);
+
+  return axios.create(axiosConfig);
 }
 
-function isRetryable(err) {
-  const s = err?.response?.status;
-  if ([429, 500, 502, 503, 504].includes(s)) return true;
-
-  const c = err?.code || "";
-  if (["ECONNABORTED", "ETIMEDOUT", "ECONNRESET", "EAI_AGAIN"].includes(c)) return true;
-
-  return /timeout/i.test(err?.message || "");
+// =========================
+// API wrappers
+// =========================
+async function apiGetCode(client, address) {
+  const res = await client.post(config.endpoints.getCode, { address });
+  if (res?.data?.code === "200") return res.data.data;
+  throw new Error(res?.data?.message || "get-code failed");
 }
 
-async function withRetry(label, fn, maxR = RETRY.maxMissionRetries) {
-  let last;
-  for (let i = 1; i <= maxR; i++) {
+async function apiChallenge(client, address, signature, inviteCode) {
+  const payload = { address, signature };
+
+  // inviteCode opsional (tidak memaksa / tidak bypass)
+  if (inviteCode && String(inviteCode).trim() !== "") {
+    payload.inviteCode = String(inviteCode).trim();
+  }
+
+  const res = await client.post(config.endpoints.challenge, payload);
+  if (res?.data?.code === "200") return res.data.data;
+  throw new Error(res?.data?.message || "challenge failed");
+}
+
+async function apiMe(client) {
+  const res = await client.get(config.endpoints.me);
+  if (res?.data?.code === "200") return res.data.data;
+  throw new Error(res?.data?.message || "/me failed");
+}
+
+async function apiArenaOverview(client) {
+  const res = await client.get(config.endpoints.arenaOverview);
+  if (res?.data?.code === "200") return res.data.data;
+  throw new Error(res?.data?.message || "overview failed");
+}
+
+async function apiMissions(client) {
+  const res = await client.get(config.endpoints.arenaMissions);
+  if (res?.data?.code === "200") return res.data.data;
+  throw new Error(res?.data?.message || "missions failed");
+}
+
+async function apiCompleteMission(client, groupId, questionId, optionId) {
+  const url = `${config.endpoints.arenaMissions}/${groupId}/questions/${questionId}/options/${optionId}`;
+  const res = await client.post(url, {});
+  if (res?.data?.code === "200") return res.data.data;
+  throw new Error(res?.data?.message || "complete mission failed");
+}
+
+// =========================
+// Auth
+// =========================
+async function login(client, account) {
+  const wallet = new ethers.Wallet(account.privateKey);
+  const address = wallet.address;
+
+  console.log(chalk.cyan(`[${account.name}] Requesting login code...`));
+  const codeData = await apiGetCode(client, address);
+
+  console.log(chalk.cyan(`[${account.name}] Signing challenge...`));
+  const signature = await wallet.signMessage(codeData.code);
+
+  await randomDelay(600, 1200);
+
+  const invite = (account.inviteCode ?? config.inviteCode ?? "").trim();
+  console.log(
+    chalk.cyan(`[${account.name}] Submitting signature...${invite ? " (with inviteCode)" : ""}`)
+  );
+
+  const auth = await apiChallenge(client, address, signature, invite);
+  console.log(chalk.green(`[${account.name}] ✓ Login OK`));
+  return { token: auth.token, expiredAt: auth.expiredAt, address };
+}
+
+// =========================
+// Main work per account
+// =========================
+async function processAccount(account, tokensStore) {
+  const ua = pickUA();
+  const client = createClient(account.proxy, ua);
+
+  const result = {
+    name: account.name,
+    address: null,
+    points: 0,
+    todayPoints: 0,
+    missionsCompleted: 0,
+    totalMissions: 0,
+    status: "OK",
+  };
+
+  try {
+    const tKey = tokenKeyForAccount(account);
+    let tokenData = tokensStore[tKey];
+
+    if (!tokenData || isTokenExpired(tokenData.expiredAt)) {
+      console.log(chalk.yellow(`[${account.name}] Token expired/not found → login...`));
+      tokenData = await login(client, account);
+      tokensStore[tKey] = tokenData;
+      saveJson(TOKENS_FILE, tokensStore);
+    }
+
+    result.address = tokenData.address;
+    client.defaults.headers.common.Authorization = `Bearer ${tokenData.token}`;
+
+    await randomDelay(config.delays.minDelay, config.delays.maxDelay);
+
+    console.log(chalk.cyan(`[${account.name}] Fetching profile...`));
+    const me = await apiMe(client);
+    console.log(chalk.gray(`[${account.name}] wallet=${me.walletAddress || tokenData.address}`));
+
+    await randomDelay(800, 1600);
+
+    console.log(chalk.cyan(`[${account.name}] Fetching overview...`));
+    const overview = await apiArenaOverview(client);
+    result.points = overview.totalPoints || 0;
+    result.todayPoints = overview.todayPoints || 0;
+
+    console.log(chalk.green(`[${account.name}] Points: total=${result.points} today=${result.todayPoints}`));
+
+    await randomDelay(800, 1600);
+
+    console.log(chalk.cyan(`[${account.name}] Fetching missions...`));
+    const mdata = await apiMissions(client);
+    const missions = mdata.missions || [];
+    const groupId = mdata.group_id;
+
+    result.totalMissions = missions.length;
+
+    const todo = missions.filter((m) => !m.dealt);
+    console.log(chalk.yellow(`[${account.name}] Incomplete: ${todo.length}/${missions.length}`));
+
+    for (const mission of todo) {
+      const answers = Array.isArray(mission.answers_ids) ? mission.answers_ids : [];
+      if (answers.length === 0) continue;
+
+      const selected = answers[randInt(0, answers.length - 1)];
+      await randomDelay(config.delays.betweenMissions, config.delays.betweenMissions + 1200);
+
+      try {
+        await apiCompleteMission(client, groupId, mission.question_id, selected);
+        result.missionsCompleted += 1;
+
+        const plus = mission.expect_points || 0;
+        result.todayPoints += plus;
+
+        console.log(chalk.green(`[${account.name}] ✓ Mission done (+${plus})`));
+      } catch (e) {
+        console.log(chalk.red(`[${account.name}] ✗ Mission failed: ${e.message}`));
+      }
+    }
+  } catch (e) {
+    result.status = "ERROR";
+    console.log(chalk.red(`[${account.name}] ERROR: ${e.message}`));
+  }
+
+  return result;
+}
+
+function showTable(results) {
+  const table = new Table({
+    head: ["Account", "Address", "Total", "Today", "Missions", "Status"],
+    colWidths: [14, 16, 8, 8, 12, 10],
+  });
+
+  for (const r of results) {
+    table.push([
+      r.name,
+      (r.address || "-").slice(0, 14) + "...",
+      r.points,
+      r.todayPoints,
+      `${r.missionsCompleted}/${r.totalMissions}`,
+      r.status === "OK" ? chalk.green("OK") : chalk.red("ERR"),
+    ]);
+  }
+
+  console.log(table.toString());
+}
+
+async function runOnce() {
+  const accounts = loadAccounts();
+  const tokensStore = loadJsonSafe(TOKENS_FILE, {});
+
+  console.log(chalk.cyan(`\n[${new Date().toISOString()}] Cycle start`));
+  const results = [];
+
+  for (let i = 0; i < accounts.length; i++) {
+    const acc = accounts[i];
+    console.log(chalk.white(`\n[${i + 1}/${accounts.length}] ${acc.name}`));
+    console.log("─".repeat(40));
+
+    const r = await processAccount(acc, tokensStore);
+    results.push(r);
+
+    if (i < accounts.length - 1) {
+      const d = config.delays.betweenAccounts + randInt(0, 2500);
+      console.log(chalk.gray(`Waiting ${(d / 1000).toFixed(1)}s...`));
+      await sleep(d);
+    }
+  }
+
+  console.log(chalk.cyan("\nSummary"));
+  showTable(results);
+  console.log(chalk.cyan("Cycle done.\n"));
+}
+
+// =========================
+// Reset scheduler (UTC midnight + API auto-detect)
+// =========================
+function msUntilNextUtcMidnight(bufferSeconds = 60) {
+  const now = new Date();
+  const next = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0)
+  );
+  // minimal 5s supaya ga 0 / negatif karena clock skew
+  return Math.max(next.getTime() - now.getTime() + bufferSeconds * 1000, 5000);
+}
+
+function formatCountdown(ms) {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  return `${h}h ${m}m ${ss}s`;
+}
+
+async function hasNewMissions(client) {
+  const mdata = await apiMissions(client);
+  const missions = mdata?.missions || [];
+  // "reset terdeteksi" kalau ada mission yang belum dealt
+  return missions.some((m) => !m.dealt);
+}
+
+/**
+ * Auto-detect reset:
+ * 1) Sleep sampai mendekati 00:00 UTC (+buffer)
+ * 2) Poll missions API sampai ada misi baru
+ *    (backoff + jitter)
+ */
+async function waitForDailyResetViaApi(watcherAccount, bufferSeconds = 60) {
+  const ua = pickUA();
+  const client = createClient(watcherAccount.proxy, ua);
+
+  // ensure token watcher valid
+  const tokensStore = loadJsonSafe(TOKENS_FILE, {});
+  const tKey = tokenKeyForAccount(watcherAccount);
+  let tokenData = tokensStore[tKey];
+
+  if (!tokenData || isTokenExpired(tokenData.expiredAt)) {
+    console.log(chalk.yellow(`[${watcherAccount.name}] Token expired before reset-check → login...`));
+    tokenData = await login(client, watcherAccount);
+    tokensStore[tKey] = tokenData;
+    saveJson(TOKENS_FILE, tokensStore);
+  }
+
+  client.defaults.headers.common.Authorization = `Bearer ${tokenData.token}`;
+
+  // 1) sleep sampai dekat reset
+  const waitMs = msUntilNextUtcMidnight(bufferSeconds);
+  const wakeAt = new Date(Date.now() + waitMs);
+
+  console.log(chalk.cyan(`[INFO] New missions available at 00:00 UTC`));
+  console.log(chalk.cyan(`[INFO] Wake at: ${wakeAt.toISOString()}`));
+  console.log(chalk.gray(`[INFO] Sleeping: ${formatCountdown(waitMs)} (Ctrl+C to stop)\n`));
+
+  await sleep(waitMs);
+
+  // 2) poll sampai reset beneran terjadi
+  console.log(chalk.cyan(`[INFO] Checking API for new missions (watcher: ${watcherAccount.name})...`));
+
+  let attempt = 0;
+  let delayMs = 5000; // start 5s, backoff to 60s max
+
+  while (true) {
+    attempt += 1;
     try {
-      return await fn();
-    } catch (e) {
-      last = e;
-      if (!isRetryable(e)) throw e;
-
-      const status = e?.response?.status || "";
-      const w =
-        Math.min(RETRY.maxBackoffMs, Math.floor(RETRY.baseBackoffMs * Math.pow(1.7, i - 1))) +
-        randInt(0, 1500);
-
+      const ok = await hasNewMissions(client);
+      if (ok) {
+        console.log(chalk.green(`[INFO] ✅ Reset detected by API (attempt ${attempt})\n`));
+        return;
+      }
       console.log(
-        chalk.yellow(
-          `[RETRY] ${label} ${i}/${maxR} status=${status} msg=${e.message} → wait ${(w / 1000).toFixed(
-            1
-          )}s`
+        chalk.gray(
+          `[INFO] Not reset yet (attempt ${attempt}). Waiting ${(delayMs / 1000).toFixed(1)}s...`
         )
       );
-      await sleep(w);
-    }
-  }
-  throw last;
-}
-
-// hard timeout biar 1 akun gak nge-freeze seluruh batch
-function withHardTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, rej) =>
-      setTimeout(() => rej(new Error(`HARD_TIMEOUT ${label} > ${ms}ms`)), ms)
-    ),
-  ]);
-}
-
-// ---------- API ----------
-const apiGetCode = (c, a) =>
-  withRetry("getCode", async () => {
-    const r = await c.post(config.endpoints.getCode, { address: a });
-    if (r.data.code === "200") return r.data.data;
-    throw new Error(r.data.message);
-  });
-
-const apiChallenge = (c, a, s, i) =>
-  withRetry("challenge", async () => {
-    const payload = { address: a, signature: s };
-    if (i && String(i).trim() !== "") payload.inviteCode = String(i).trim();
-
-    const r = await c.post(config.endpoints.challenge, payload);
-    if (r.data.code === "200") return r.data.data;
-    throw new Error(r.data.message);
-  });
-
-const apiMe = (c) =>
-  withRetry("me", async () => {
-    const r = await c.get(config.endpoints.me);
-    if (r.data.code === "200") return r.data.data;
-    throw new Error(r.data.message);
-  });
-
-const apiOverview = (c) =>
-  withRetry("overview", async () => {
-    const r = await c.get(config.endpoints.arenaOverview);
-    if (r.data.code === "200") return r.data.data;
-    throw new Error(r.data.message);
-  });
-
-const apiMissions = (c) =>
-  withRetry("missions", async () => {
-    const r = await c.get(config.endpoints.arenaMissions);
-    if (r.data.code === "200") return r.data.data;
-    throw new Error(r.data.message);
-  });
-
-const apiComplete = (c, g, q, o) =>
-  withRetry(`mission ${q}`, async () => {
-    const r = await c.post(
-      `${config.endpoints.arenaMissions}/${g}/questions/${q}/options/${o}`,
-      {}
-    );
-    if (r.data.code === "200") return r.data.data;
-    throw new Error(r.data.message);
-  });
-
-// ---------- LOGIN ----------
-async function login(client, acc) {
-  const w = new ethers.Wallet(acc.privateKey);
-  console.log(chalk.cyan(`[${acc.name}] login...`));
-
-  const code = await apiGetCode(client, w.address);
-  const sig = await w.signMessage(code.code);
-
-  const invite = acc.inviteCode || config.inviteCode || "";
-  const auth = await apiChallenge(client, w.address, sig, invite);
-
-  console.log(chalk.green(`[${acc.name}] ✓ Login OK`));
-  return { token: auth.token, expiredAt: auth.expiredAt, address: w.address };
-}
-
-// ---------- PROCESS ACCOUNT ----------
-async function processAccount(acc, tokens) {
-  for (let attempt = 1; attempt <= RETRY.maxAccountRetries; attempt++) {
-    try {
-      const ua = pickUA();
-      const c = createClient(acc.proxy, ua);
-
-      const key = tokenKeyForAccount(acc);
-      let t = tokens[key];
-
-      if (!t || isTokenExpired(t.expiredAt)) {
-        console.log(chalk.yellow(`[${acc.name}] token expired/not found → login...`));
-        t = await login(c, acc);
-        tokens[key] = t;
-        saveJson(TOKENS_FILE, tokens);
-      }
-
-      c.defaults.headers.common.Authorization = `Bearer ${t.token}`;
-
-      console.log(chalk.cyan(`[${acc.name}] profile...`));
-      await apiMe(c);
-
-      console.log(chalk.cyan(`[${acc.name}] overview...`));
-      const ov = await apiOverview(c);
-
-      let done = 0,
-        total = 0;
-
-      // refresh loop supaya kalau ada mission fail/timeout tetap ngejar sampai habis
-      for (let round = 0; round < 10; round++) {
-        console.log(chalk.cyan(`[${acc.name}] missions list... (round ${round + 1}/10)`));
-        const md = await apiMissions(c);
-        const todo = (md.missions || []).filter((x) => !x.dealt);
-        total = (md.missions || []).length;
-
-        console.log(chalk.yellow(`[${acc.name}] incomplete ${todo.length}/${total}`));
-
-        if (!todo.length) break;
-
-        for (const m of todo) {
-          const opt = m.answers_ids?.[randInt(0, (m.answers_ids || []).length - 1)];
-          if (!opt) continue;
-
-          console.log(chalk.yellow(`[${acc.name}] complete mission ${m.question_id}...`));
-          await apiComplete(c, md.group_id, m.question_id, opt);
-          done++;
-
-          await sleep(randInt(1500, 3500));
-        }
-
-        await sleep(randInt(2000, 5000));
-      }
-
-      return {
-        name: acc.name,
-        address: t.address,
-        points: ov.totalPoints || 0,
-        today: ov.todayPoints || 0,
-        done,
-        total,
-        status: "OK",
-      };
     } catch (e) {
-      console.log(chalk.red(`[${acc.name}] attempt ${attempt} error: ${e.message}`));
+      console.log(chalk.yellow(`[WARN] Reset-check error: ${e.message}. Retrying...`));
 
-      if (attempt === RETRY.maxAccountRetries) {
-        return {
-          name: acc.name,
-          address: "-",
-          points: 0,
-          today: 0,
-          done: 0,
-          total: 0,
-          status: "ERR",
-        };
-      }
-
-      await sleep(RETRY.baseBackoffMs * attempt);
+      // kalau token invalid/expired mendadak, relogin
+      try {
+        if (String(e.message || "").toLowerCase().includes("401")) {
+          throw e;
+        }
+      } catch (_) {}
     }
+
+    const jitter = randInt(0, 1500);
+    await sleep(delayMs + jitter);
+    delayMs = Math.min(Math.floor(delayMs * 1.4), 60000);
   }
 }
 
-// ---------- TABLE ----------
-function showTable(res) {
-  const t = new Table({ head: ["Account", "Address", "Total", "Today", "Missions", "Status"] });
-  res.forEach((r) =>
-    t.push([
-      r.name,
-      (r.address || "-").slice(0, 12) + "...",
-      r.points,
-      r.today,
-      `${r.done}/${r.total}`,
-      r.status === "OK" ? chalk.green("OK") : chalk.red("ERR"),
-    ])
-  );
-  console.log(t.toString());
-}
+// =========================
+// App loop
+// =========================
+async function main() {
+  const accounts = loadAccounts();
+  const watcher = accounts[0]; // pakai akun pertama sebagai watcher reset
 
-// ---------- RUN CYCLE ----------
-async function runOnce() {
-  const accs = loadAccounts();
-  const tokens = loadJsonSafe(TOKENS_FILE, {});
-  const out = [];
-
-  for (let i = 0; i < accs.length; i++) {
-    console.log(`\n[${i + 1}/${accs.length}] ${accs[i].name}`);
-
-    // hard-timeout 2 menit per account (anti hang)
-    const r = await withHardTimeout(processAccount(accs[i], tokens), 120000, accs[i].name)
-      .catch((e) => {
-        console.log(chalk.red(`[${accs[i].name}] ${e.message}`));
-        return { name: accs[i].name, address: "-", points: 0, today: 0, done: 0, total: 0, status: "ERR" };
-      });
-
-    out.push(r);
-
-    if (i < accs.length - 1) await sleep(randInt(4000, 7000));
-  }
-
-  showTable(out);
-}
-
-// ---------- RESET DETECT ----------
-function msToUtcMidnight(buf = 60) {
-  const n = new Date();
-  const nx = new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate() + 1, 0, 0, 0));
-  return Math.max(nx - n + buf * 1000, 5000);
-}
-
-async function waitReset() {
-  const ms = msToUtcMidnight(60);
-  console.log(`[INFO] New missions available at 00:00 UTC`);
-  console.log(`[INFO] Sleeping ${Math.floor(ms / 1000)}s`);
-  await sleep(ms);
-}
-
-// ---------- MAIN LOOP ----------
-(async () => {
-  loadAccounts(); // validate
   while (true) {
     await runOnce();
-    await waitReset();
+    await waitForDailyResetViaApi(watcher, 60);
   }
-})();
+}
+
+process.on("SIGINT", () => {
+  console.log(chalk.yellow("\n[INFO] Stopped."));
+  process.exit(0);
+});
+
+main().catch((e) => {
+  console.log(chalk.red(`[FATAL] ${e.message}`));
+  process.exit(1);
+});
