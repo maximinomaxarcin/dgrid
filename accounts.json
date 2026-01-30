@@ -1,0 +1,14 @@
+[
+  {
+    "name": "acc1",
+    "privateKey": "0xYOUR_PRIVATE_KEY",
+    "proxy": "",
+    "inviteCode": ""
+  },
+  {
+    "name": "acc2",
+    "privateKey": "0xYOUR_PRIVATE_KEY_2",
+    "proxy": "http://user:pass@ip:port",
+    "inviteCode": ""
+  }
+]
