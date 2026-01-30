@@ -1,0 +1,20 @@
+{
+  "baseUrl": "https://api2.dgrid.ai/api/v1",
+  "endpoints": {
+    "getCode": "/client-user/get-code",
+    "challenge": "/client-user/challenge",
+    "me": "/me",
+    "arenaOverview": "/arena/overview",
+    "arenaMissions": "/arena/missions"
+  },
+  "delays": {
+    "minDelay": 1200,
+    "maxDelay": 3500,
+    "betweenAccounts": 4000,
+    "betweenMissions": 2500
+  },
+  "scheduler": {
+    "checkIntervalMinutes": 60
+  },
+  "inviteCode": ""
+}
